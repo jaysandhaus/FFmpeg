@@ -3337,6 +3337,10 @@ static int check_keyboard_interaction(int64_t cur_time)
         if(debug) av_log_set_level(AV_LOG_DEBUG);
         fprintf(stderr,"debug=%d\n", debug);
     }
+    if( key == 'r' ) {
+        for( i=0; i < nb_output_files; i++ )
+            avdevice_app_to_dev_control_message( output_files[i]->ctx, MKBETAG('S','E','G','N'), NULL, 0 );
+    }
     if (key == '?'){
         fprintf(stderr, "key    function\n"
                         "?      show this help\n"

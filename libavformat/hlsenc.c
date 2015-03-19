@@ -32,6 +32,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/opt.h"
 #include "libavutil/log.h"
+#include "libavutil/time.h"
 
 #include "avformat.h"
 #include "internal.h"
@@ -42,7 +43,10 @@ typedef struct HLSSegment {
     double duration; /* in seconds */
     int64_t pos;
     int64_t size;
-
+    
+    char comment[1024];
+    int64_t requested_break;
+    int64_t creation_time;
     struct HLSSegment *next;
 } HLSSegment;
 
@@ -85,6 +89,10 @@ typedef struct HLSContext {
     char *baseurl;
     char *format_options_str;
     AVDictionary *format_options;
+    
+    int64_t segment_now;
+    int64_t hls_timestamps;
+    
 } HLSContext;
 
 static int hls_delete_old_segments(HLSContext *hls) {
@@ -177,7 +185,8 @@ static int hls_mux_init(AVFormatContext *s)
         st->time_base = s->streams[i]->time_base;
     }
     hls->start_pos = 0;
-
+    hls->segment_now = 0;
+    
     return 0;
 }
 
@@ -197,7 +206,10 @@ static int hls_append_segment(HLSContext *hls, double duration, int64_t pos,
     en->pos      = pos;
     en->size     = size;
     en->next     = NULL;
-
+    memset( en->comment, 0, sizeof(en->comment) );
+    en->requested_break = 0;
+    en->creation_time = av_gettime();
+    
     if (!hls->segments)
         hls->segments = en;
     else
@@ -274,6 +286,17 @@ static int hls_window(AVFormatContext *s, int last)
            sequence);
 
     for (en = hls->segments; en; en = en->next) {
+        if( strlen( en->comment ) )
+            avio_printf( out, "#%s\n", en->comment );
+        if( en->requested_break )
+            avio_printf( out, "#%s\n", "HLSENC:SEGMENT BREAK REQUESTED HERE" );
+        if( hls->hls_timestamps ) {
+            char tbuf[128];
+            struct tm time = *gmtime((time_t*)&en->creation_time);
+            strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%S%z", &time);
+            av_log(hls, AV_LOG_WARNING, "Creation time: %s\n", tbuf );
+            avio_printf( out, "#EXT-X-PROGRAM-DATE-TIME:%s\n", tbuf);
+        }
         avio_printf(out, "#EXTINF:%f,\n", en->duration);
         if (hls->flags & HLS_SINGLE_FILE)
              avio_printf(out, "#EXT-X-BYTERANGE:%"PRIi64"@%"PRIi64"\n",
@@ -438,15 +461,19 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
         hls->duration = (double)(pkt->pts - hls->end_pts)
                                    * st->time_base.num / st->time_base.den;
 
-    if (can_split && av_compare_ts(pkt->pts - hls->start_pts, st->time_base,
-                                   end_pts, AV_TIME_BASE_Q) >= 0) {
-        int64_t new_start_pos;
+    if (can_split && ( hls->segment_now || av_compare_ts(pkt->pts - hls->start_pts, st->time_base,
+                                   end_pts, AV_TIME_BASE_Q) >= 0 ) ) {
+         int64_t new_start_pos;
         av_write_frame(oc, NULL); /* Flush any buffered data */
 
         new_start_pos = avio_tell(hls->avf->pb);
         hls->size = new_start_pos - hls->start_pos;
         ret = hls_append_segment(hls, hls->duration, hls->start_pos, hls->size);
         hls->start_pos = new_start_pos;
+        if( hls->segment_now && ret == 0 ) {
+            hls->segment_now = 0;
+            hls->last_segment->requested_break = 1;
+        }
         if (ret < 0)
             return ret;
 
@@ -498,6 +525,20 @@ static int hls_write_trailer(struct AVFormatContext *s)
     return 0;
 }
 
+static int hls_control_message(AVFormatContext *s, int type, void *data, size_t data_size)
+{
+    HLSContext *hls = s->priv_data;
+    
+    switch(type) {
+        case MKBETAG('S','E','G','N'):
+            hls->segment_now = 1;
+            return 0;
+        default:
+            break;
+    }
+    return AVERROR(ENOSYS);
+}
+
 #define OFFSET(x) offsetof(HLSContext, x)
 #define E AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
@@ -512,7 +553,7 @@ static const AVOption options[] = {
     {"hls_flags",     "set flags affecting HLS playlist and media file generation", OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64 = 0 }, 0, UINT_MAX, E, "flags"},
     {"single_file",   "generate a single media file indexed with byte ranges", 0, AV_OPT_TYPE_CONST, {.i64 = HLS_SINGLE_FILE }, 0, UINT_MAX,   E, "flags"},
     {"delete_segments", "delete segment files that are no longer part of the playlist", 0, AV_OPT_TYPE_CONST, {.i64 = HLS_DELETE_SEGMENTS }, 0, UINT_MAX,   E, "flags"},
-
+    {"hls_timestamps",  "add EXT-X-PROGRAM-DATE-TIME to each segment using system time", OFFSET(hls_timestamps), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, E },
     { NULL },
 };
 
@@ -535,5 +576,6 @@ AVOutputFormat ff_hls_muxer = {
     .write_header   = hls_write_header,
     .write_packet   = hls_write_packet,
     .write_trailer  = hls_write_trailer,
+    .control_message = hls_control_message,
     .priv_class     = &hls_class,
 };
